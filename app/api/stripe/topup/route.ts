@@ -1,133 +1,92 @@
-// pages/api/stripe/topup.ts
-// Crea una Stripe Checkout Session para recarga de pulsera cashless
-// Llamado desde inout-kiosk (kiosco autoservicio)
+import { NextRequest, NextResponse } from 'next/server'
+import { createStripeCheckout } from '@/lib/stripe'
+import { createSupabaseAdmin } from '@/lib/supabase'
 
-import type { NextApiRequest, NextApiResponse } from 'next'
-import Stripe from 'stripe'
-import { createClient } from '@supabase/supabase-js'
+const FEE_PCT = 3.5
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2024-06-20',
-})
+const CORS = {
+  'Access-Control-Allow-Origin':  '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+}
 
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_KEY!
-)
+export async function OPTIONS() {
+  return new NextResponse(null, { status: 204, headers: CORS })
+}
 
-const FEE_PCT = 3.5 // comisión visible al usuario
-
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  // CORS
-  res.setHeader('Access-Control-Allow-Origin', '*')
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
-  if (req.method === 'OPTIONS') return res.status(204).end()
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
-
-  const {
-    wristband_id,
-    uid,
-    amount,       // importe a recargar (sin comisión)
-    event_id,
-    operator,
-    success_url,
-    cancel_url,
-  } = req.body
-
-  // Validaciones básicas
-  if (!wristband_id || !uid || !amount || amount <= 0) {
-    return res.status(400).json({ error: 'Faltan parámetros obligatorios' })
-  }
-  if (amount > 500) {
-    return res.status(400).json({ error: 'Importe máximo 500€' })
-  }
-
-  // Verificar que la pulsera existe y está activa
-  const { data: wristband, error: wbError } = await supabase
-    .from('rfid_wristbands')
-    .select('id, uid, holder_name, balance, status, event_id')
-    .eq('id', wristband_id)
-    .single()
-
-  if (wbError || !wristband) {
-    return res.status(404).json({ error: 'Pulsera no encontrada' })
-  }
-  if (wristband.status !== 'active') {
-    return res.status(400).json({ error: 'Pulsera bloqueada o inactiva' })
-  }
-
-  // Calcular comisión y total
-  const fee       = Math.round(amount * FEE_PCT) / 100
-  const totalPay  = Math.round((amount + fee) * 100) // en céntimos para Stripe
-  const reference = `KIOSK-${uid}-${Date.now()}`
-
+export async function POST(req: NextRequest) {
   try {
-    // Crear Stripe Checkout Session
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      currency: 'eur',
-      line_items: [
-        {
-          quantity: 1,
-          price_data: {
-            currency: 'eur',
-            unit_amount: totalPay,
-            product_data: {
-              name: `Recarga cashless — ${wristband.holder_name || uid}`,
-              description: `Añade ${amount.toFixed(2)}€ a tu pulsera InOut (incl. ${fee.toFixed(2)}€ comisión)`,
-              images: [], // se puede añadir logo después
-            },
-          },
-        },
-      ],
-      // URLs de retorno — el kiosco las gestiona
-      success_url: success_url || `https://inout-kiosk.vercel.app?stripe=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url:  cancel_url  || `https://inout-kiosk.vercel.app?stripe=cancel`,
+    const {
+      wristband_id, uid, amount,
+      event_id, operator, success_url, cancel_url,
+    } = await req.json()
 
-      // Metadatos para verificación posterior
+    if (!wristband_id || !uid || !amount || amount <= 0)
+      return NextResponse.json({ error: 'Faltan parámetros' }, { status: 400, headers: CORS })
+
+    if (amount > 500)
+      return NextResponse.json({ error: 'Importe máximo 500€' }, { status: 400, headers: CORS })
+
+    const supabase = createSupabaseAdmin()
+
+    const { data: wb, error: wbErr } = await supabase
+      .from('rfid_wristbands')
+      .select('id, uid, holder_name, balance, status, event_id')
+      .eq('id', wristband_id)
+      .single()
+
+    if (wbErr || !wb)
+      return NextResponse.json({ error: 'Pulsera no encontrada' }, { status: 404, headers: CORS })
+
+    if (wb.status !== 'active')
+      return NextResponse.json({ error: 'Pulsera bloqueada' }, { status: 400, headers: CORS })
+
+    const fee       = Math.round(amount * FEE_PCT) / 100
+    const reference = `KIOSK-${uid}-${Date.now()}`
+
+    const session = await createStripeCheckout({
+      amount,
+      fee,
+      description:  `Recarga cashless — ${wb.holder_name || uid}`,
+      reference,
+      success_url:  success_url || `https://inout-kiosk.vercel.app?stripe=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url:   cancel_url  || `https://inout-kiosk.vercel.app?stripe=cancel`,
       metadata: {
         wristband_id,
         uid,
-        topup_amount: String(amount),    // importe a acreditar (sin comisión)
+        topup_amount: String(amount),
         fee:          String(fee),
-        event_id:     event_id || '',
-        operator:     operator || 'kiosk',
+        event_id:     event_id  || '',
+        operator:     operator  || 'kiosk',
         reference,
-      },
-
-      // Configuración de UI
-      payment_intent_data: {
-        description: `Recarga InOut — ${uid}`,
-        metadata: { wristband_id, uid, reference },
       },
     })
 
-    // Guardar registro pendiente en Supabase para trazabilidad
+    // Transacción pendiente para trazabilidad
     await supabase.from('rfid_transactions').insert({
       wristband_id,
-      event_id:        event_id || wristband.event_id,
+      event_id:        event_id || wb.event_id,
       type:            'topup_pending',
-      amount:          0,             // se actualiza a positivo al confirmar
-      balance_after:   wristband.balance,
+      amount:          0,
+      balance_after:   wb.balance,
       description:     `Recarga kiosco (pendiente) — ${reference}`,
       point_of_sale:   'kiosk',
       operator:        operator || 'kiosk',
       payment_method:  'stripe',
-      sumup_reference: reference,     // reutilizamos campo para referencia interna
+      sumup_reference: reference,
     })
 
-    return res.status(200).json({
+    return NextResponse.json({
       session_id:   session.id,
       checkout_url: session.url,
       reference,
       amount,
       fee,
       total: amount + fee,
-    })
+    }, { headers: CORS })
 
   } catch (err: any) {
-    console.error('Stripe checkout error:', err)
-    return res.status(500).json({ error: err.message || 'Error creando checkout de Stripe' })
+    console.error('[stripe/topup]', err)
+    return NextResponse.json({ error: err.message }, { status: 500, headers: CORS })
   }
 }
