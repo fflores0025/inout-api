@@ -1,126 +1,97 @@
-// pages/api/stripe/verify-topup.ts
-// Verifica el estado de una Stripe Checkout Session y acredita el saldo si está pagada
+import { NextRequest, NextResponse } from 'next/server'
+import { getStripeSession, markSessionProcessed } from '@/lib/stripe'
+import { createSupabaseAdmin } from '@/lib/supabase'
 
-import type { NextApiRequest, NextApiResponse } from 'next'
-import Stripe from 'stripe'
-import { createClient } from '@supabase/supabase-js'
+const CORS = {
+  'Access-Control-Allow-Origin':  '*',
+  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+}
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2024-06-20',
-})
+export async function OPTIONS() {
+  return new NextResponse(null, { status: 204, headers: CORS })
+}
 
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_KEY!
-)
-
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  res.setHeader('Access-Control-Allow-Origin', '*')
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
-  if (req.method === 'OPTIONS') return res.status(204).end()
-  if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' })
-
-  const { session_id, wristband: wristband_id, amount, ref } = req.query
-
-  if (!session_id || !wristband_id) {
-    return res.status(400).json({ error: 'Faltan parámetros' })
-  }
-
+export async function GET(req: NextRequest) {
   try {
-    // Obtener estado de la sesión de Stripe
-    const session = await stripe.checkout.sessions.retrieve(session_id as string)
+    const { searchParams } = new URL(req.url)
+    const session_id   = searchParams.get('session_id')
+    const wristband_id = searchParams.get('wristband')
+    const amount       = searchParams.get('amount')
 
-    // Si ya fue procesada anteriormente → devolver estado actual sin tocar saldo
+    if (!session_id || !wristband_id)
+      return NextResponse.json({ error: 'Faltan parámetros' }, { status: 400, headers: CORS })
+
+    const supabase = createSupabaseAdmin()
+    const session  = await getStripeSession(session_id)
+
+    // Ya procesada
     if (session.metadata?.already_processed === 'true') {
       const { data: wb } = await supabase
         .from('rfid_wristbands')
         .select('balance, holder_name')
         .eq('id', wristband_id)
         .single()
-
-      return res.status(200).json({
-        status:      'completed',
-        balance:     wb?.balance,
-        holder_name: wb?.holder_name,
-        session_status: session.status,
-      })
+      return NextResponse.json({ status: 'completed', balance: wb?.balance, holder_name: wb?.holder_name }, { headers: CORS })
     }
 
-    // Sesión no pagada aún
+    // Pendiente o expirada
     if (session.payment_status !== 'paid' || session.status !== 'complete') {
-      return res.status(200).json({
+      return NextResponse.json({
         status:         session.status === 'expired' ? 'expired' : 'pending',
         payment_status: session.payment_status,
-        session_status: session.status,
-      })
+      }, { headers: CORS })
     }
 
-    // ── PAGO CONFIRMADO ── Acreditar saldo
-    const topupAmount = parseFloat(session.metadata?.topup_amount || String(amount) || '0')
-    if (topupAmount <= 0) {
-      return res.status(400).json({ error: 'Importe inválido en metadata' })
-    }
+    // ── PAGADA — acreditar saldo ──
+    const topupAmount = parseFloat(session.metadata?.topup_amount || amount || '0')
+    if (topupAmount <= 0)
+      return NextResponse.json({ error: 'Importe inválido' }, { status: 400, headers: CORS })
 
-    // Obtener saldo actual
-    const { data: wristband, error: wbError } = await supabase
+    const { data: wb } = await supabase
       .from('rfid_wristbands')
       .select('id, balance, holder_name, total_loaded, event_id')
       .eq('id', wristband_id)
       .single()
 
-    if (wbError || !wristband) {
-      return res.status(404).json({ error: 'Pulsera no encontrada' })
-    }
+    if (!wb)
+      return NextResponse.json({ error: 'Pulsera no encontrada' }, { status: 404, headers: CORS })
 
-    const newBalance   = parseFloat(wristband.balance) + topupAmount
-    const newTotalLoad = parseFloat(wristband.total_loaded || '0') + topupAmount
+    const newBalance   = parseFloat(wb.balance) + topupAmount
+    const newTotalLoad = parseFloat(wb.total_loaded || '0') + topupAmount
     const reference    = session.metadata?.reference || `STRIPE-${session_id}`
 
-    // Actualizar saldo en Supabase
-    const { error: updateError } = await supabase
-      .from('rfid_wristbands')
-      .update({
-        balance:      newBalance,
-        total_loaded: newTotalLoad,
-        last_used_at: new Date().toISOString(),
-      })
-      .eq('id', wristband_id)
+    await supabase.from('rfid_wristbands').update({
+      balance:      newBalance,
+      total_loaded: newTotalLoad,
+      last_used_at: new Date().toISOString(),
+    }).eq('id', wristband_id)
 
-    if (updateError) {
-      console.error('Error updating balance:', updateError)
-      return res.status(500).json({ error: 'Error actualizando saldo' })
-    }
-
-    // Registrar transacción completada
     await supabase.from('rfid_transactions').insert({
       wristband_id,
-      event_id:       session.metadata?.event_id || wristband.event_id,
-      type:           'topup',
-      amount:         topupAmount,
-      balance_after:  newBalance,
-      description:    `Recarga kiosco — ${reference}`,
-      point_of_sale:  'kiosk',
-      operator:       session.metadata?.operator || 'kiosk',
-      payment_method: 'stripe',
+      event_id:        session.metadata?.event_id || wb.event_id,
+      type:            'topup',
+      amount:          topupAmount,
+      balance_after:   newBalance,
+      description:     `Recarga kiosco — ${reference}`,
+      point_of_sale:   'kiosk',
+      operator:        session.metadata?.operator || 'kiosk',
+      payment_method:  'stripe',
       sumup_reference: reference,
     })
 
-    // Marcar sesión como procesada para evitar doble acreditación
-    await stripe.checkout.sessions.update(session_id as string, {
-      metadata: { ...session.metadata, already_processed: 'true' },
-    })
+    await markSessionProcessed(session_id, session.metadata as Record<string, string>)
 
-    return res.status(200).json({
-      status:      'paid',
-      balance:     newBalance,
-      holder_name: wristband.holder_name,
+    return NextResponse.json({
+      status:       'paid',
+      balance:      newBalance,
+      holder_name:  wb.holder_name,
       topup_amount: topupAmount,
       reference,
-    })
+    }, { headers: CORS })
 
   } catch (err: any) {
-    console.error('Stripe verify error:', err)
-    return res.status(500).json({ error: err.message || 'Error verificando pago' })
+    console.error('[stripe/verify-topup]', err)
+    return NextResponse.json({ error: err.message }, { status: 500, headers: CORS })
   }
 }
