@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "next": "^14.2.0",
@@ -17,6 +18,7 @@
   "devDependencies": {
     "typescript": "^5.3.0",
     "@types/node": "^20.0.0",
-    "@types/react": "^18.2.0"
+    "@types/react": "^18.2.0",
+    "tsx": "^4.19.0"
   }
 }
